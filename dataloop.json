@@ -1,0 +1,198 @@
+{
+    "name": "video-preprocess-husam",
+    "displayName": "Video Preprocess husam",
+    "description": "Unified Video Preprocess Application - metadata extraction and thumbnail generation",
+    "attributes": {
+        "Provider": "Dataloop"
+    },
+    "version": "1.0.0",
+    "scope": "project",
+    "components": {
+        "modules": [
+            {
+                "name": "video_preprocess_module",
+                "entryPoint": "main.py",
+                "className": "VideoPreprocess",
+                "initInputs": [],
+                "functions": [
+                    {
+                        "name": "on_create",
+                        "description": "Run video preprocess - metadata extraction and/or thumbnail generation, controlled by trigger input configs",
+                        "input": [
+                            {
+                                "type": "Item",
+                                "name": "item"
+                            }
+                        ],
+                        "output": []
+                    },
+                    {
+                        "name": "on_delete",
+                        "description": "Delete resources created by video preprocess (thumbnail, webm modality)",
+                        "input": [
+                            {
+                                "type": "Item",
+                                "name": "item"
+                            }
+                        ],
+                        "output": []
+                    }
+                ]
+            }
+        ],
+        "services": [
+            {
+                "name": "video-preprocess-husam",
+                "moduleName": "video_preprocess_module",
+                "runtime": {
+                    "podType": "regular-m",
+                    "runnerImage": "gcr.io/viewo-g/piper/agent/cpu/video-preprocess:4",
+                    "concurrency": 5,
+                    "autoscaler": {
+                        "type": "rabbitmq",
+                        "minReplicas": 1,
+                        "maxReplicas": 60,
+                        "queueLength": 5,
+                        "cooldownPeriod": 300,
+                        "pollingInterval": 15
+                    },
+                    "preemptible": false
+                },
+                "botUserName": "pipelines@dataloop.ai",
+                "executionTimeout": 10800,
+                "maxAttempts": 3,
+                "onReset": "failed"
+            }
+        ],
+        "triggers": [
+            {
+                "name": "video-preprocess-created-husam",
+                "active": true,
+                "type": "Event",
+                "scope": "system",
+                "namespace": "services.video-preprocess-husam",
+                "spec": {
+                    "resource": "Item",
+                    "actions": [
+                        "Created",
+                        "Clone"
+                    ],
+                    "executionMode": "Once",
+                    "filter": {
+                        "$or": [
+                            {
+                                "$and": [
+                                    {
+                                        "metadata": {
+                                            "system": {
+                                                "mimetype": "video/*"
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "hidden": false
+                                    },
+                                    {
+                                        "type": "file"
+                                    }
+                                ]
+                            },
+                            {
+                                "$and": [
+                                    {
+                                        "metadata": {
+                                            "system": {
+                                                "shebang": {
+                                                    "linkInfo": {
+                                                        "mimetype": "video*"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "metadata": {
+                                            "system": {
+                                                "shebang": {
+                                                    "linkInfo": {
+                                                        "type": "url"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    "operation": {
+                        "type": "function",
+                        "functionName": "on_create"
+                    },
+                    "input": {
+                        "metadata_only": false,
+                        "thumbnail_only": false,
+                        "thumbnail_size": 128,
+                        "max_file_size_mb": 2000
+                    }
+                }
+            },
+            {
+                "name": "video-preprocess-deleted-husam",
+                "active": true,
+                "type": "Event",
+                "scope": "system",
+                "namespace": "services.video-preprocess-husam",
+                "spec": {
+                    "resource": "Item",
+                    "actions": [
+                        "Deleted"
+                    ],
+                    "executionMode": "Once",
+                    "filter": {
+                        "$or": [
+                            {
+                                "metadata": {
+                                    "system": {
+                                        "mimetype": "video/*"
+                                    }
+                                }
+                            },
+                            {
+                                "$and": [
+                                    {
+                                        "metadata": {
+                                            "system": {
+                                                "shebang": {
+                                                    "linkInfo": {
+                                                        "mimetype": "video*"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "metadata": {
+                                            "system": {
+                                                "shebang": {
+                                                    "linkInfo": {
+                                                        "type": "url"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    "input": {},
+                    "operation": {
+                        "type": "function",
+                        "functionName": "on_delete"
+                    }
+                }
+            }
+        ]
+    }
+}

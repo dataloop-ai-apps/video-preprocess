@@ -4,13 +4,16 @@ WORKDIR /app
 
 USER root
 
-# ffmpeg is required as the backend for PyAV (libav* shared libraries).
+# ffmpeg supplies the `ffprobe` binary used via subprocess in main.py.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg \
- && apt-get clean \
- && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN pip install --no-cache-dir \
+    --index-url https://artifacts.dell.com/artifactory/api/pypi/python/simple \
+    --trusted-host artifacts.dell.com \
+    -r /app/requirements.txt
 
-COPY . /app
+USER 1000

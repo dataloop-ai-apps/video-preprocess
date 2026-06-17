@@ -1,245 +1,179 @@
-"""Video Preprocess service: metadata extraction + thumbnail generation.
+"""Unified video-preprocess service.
 
-Single-file Dataloop service runner that:
-  * Extracts video metadata via PyAV (no ffprobe subprocess).
-  * Generates an animated GIF thumbnail from the first few seconds of the video
-    via OpenCV + imageio.
-  * Records any failure to ``item.metadata.system.etl`` and re-raises so the
-    service execution shows as failed and the user can see the cause in both
-    the item metadata and the service logs.
+Single-file implementation merging metadata extraction (via ffprobe) and
+thumbnail GIF generation (via OpenCV + imageio) behind one dataloop service
+and one trigger. Per-invocation behaviour is controlled via
+``context.trigger_input`` with module-level constant fallbacks.
 
-The two booleans ``EXTRACT_METADATA`` and ``EXTRACT_THUMBNAIL`` control which
-stages run. If both are False the item is skipped.
+Inputs (read from ``context.trigger_input``):
+    metadata_only      – bool (default False)  only run ffprobe metadata stage
+    thumbnail_only     – bool (default False)  only run thumbnail stage
+    thumbnail_size     – int  (default DEFAULT_THUMB_SIZE)
+    max_file_size_mb   – int  (default MAX_FILE_SIZE_MB)
 """
 
+from __future__ import annotations
+
+import json
 import logging
 import math
 import os
 import shutil
+import subprocess
 import traceback
-from fractions import Fraction
 
-import av
 import cv2
 import dtlpy as dl
 import imageio
-import numpy as np
 
-logger = logging.getLogger("video_preprocess")
-
-# ---------------------------------------------------------------------------
-# Configuration (module-level constants — change here to alter behaviour)
-# ---------------------------------------------------------------------------
-
-# Stage toggles. If both are False the service skips the item.
-EXTRACT_METADATA = True
-EXTRACT_THUMBNAIL = True
-
-# Thumbnail config.
-MAX_GEN_THUMB_SIZE_MB = 70       # skip thumbnail if the file is larger than this
-DEFAULT_THUMB_SIZE = 128         # longest edge of the GIF in pixels; aspect preserved
-THUMB_DURATION_SEC = 3.0         # how many seconds of video to sample for the GIF
-
-# Backward-compat fields written outside ``system`` (kept from the legacy code).
-_VALIDATION_FIELDS = ('ffmpeg', 'height', 'width', 'fps', 'duration')
-
+logger = logging.getLogger("video-preprocess")
 
 # ---------------------------------------------------------------------------
-# ETL error helper (modelled on image-preprocess-app/common/etl_errors.py)
+# Module-level default constants (overridable per-invocation via trigger_input)
 # ---------------------------------------------------------------------------
 
-def record_etl_error(item: dl.Item, stage: str, error: str,
-                     failed: bool = False) -> list:
-    """Append an entry to ``system.etl.errors`` on the item.
+DEFAULT_THUMB_SIZE = 128
+MAX_FILE_SIZE_MB = 2000        # overall input video size guard
+MAX_GEN_THUMB_SIZE_MB = 70     # additional guard specifically for thumbnail stage
+THUMB_DURATION_SEC = 3.0
+THUMB_SPEED_FACTOR = 0.25      # decoded frames played back at 1/4 speed for the GIF
 
-    When ``failed=True`` the helper also sets ``system.etl.failed = True`` and
-    mirrors the failed block under ``system.videoEtl.etl`` so downstream
-    consumers can filter on the service that produced the failure.
+# Dataset-level metadata flag that disables ETL for the whole dataset.
+SKIP_DATASET_FLAG = "skipVideoEtl"
 
-    Returns the etl errors list so callers can keep using the same reference.
-    The caller is responsible for persisting via ``item.update(system_metadata=True)``.
+# Service name used to look up the ignore list in the DataloopTasks binaries dataset.
+IGNORE_LIST_SERVICE_KEY = "video-preprocess"
+
+# Validation fields that must be populated after ffprobe runs.
+VALIDATION_KEYS = ("ffmpeg", "height", "width", "fps", "duration")
+
+
+# ---------------------------------------------------------------------------
+# record_etl_error — inlined and adapted for the video service
+# ---------------------------------------------------------------------------
+
+def record_etl_error(item: dl.Item, stage: str, error: str, failed: bool = False) -> list:
+    """Append an error to ``system.etl.errors`` and optionally set the failed flag.
+
+    When ``failed`` is True, mirrors the failed-block onto ``system.videoEtl.etl``
+    (analogous to ``imageEtl`` in the image-preprocess service) so downstream
+    consumers can detect a hard failure on the item.
     """
-    system = item.metadata.setdefault('system', {})
-    etl = system.setdefault('etl', {})
-    etl_errors = etl.setdefault('errors', [])
-    entry = {'stage': stage, 'error': error}
+    system = item.metadata.setdefault("system", {})
+    etl = system.setdefault("etl", {})
+    etl_errors = etl.setdefault("errors", [])
+    entry = {"stage": stage, "error": error}
     etl_errors.append(entry)
     if failed:
-        etl['failed'] = True
-        system.setdefault('videoEtl', {})['etl'] = {
-            'failed': True,
-            'errors': etl_errors,
+        etl["failed"] = True
+        system.setdefault("videoEtl", {})["etl"] = {
+            "failed": True,
+            "errors": etl_errors,
         }
     return etl_errors
 
 
 # ---------------------------------------------------------------------------
-# Parsing helpers
+# Pure helpers
 # ---------------------------------------------------------------------------
 
+def _safe_parse_fraction(value):
+    """Parse FPS-style strings like ``"30000/1001"`` or ``"29.97"``.
+
+    Returns ``float`` or ``None`` on failure. Avoids ``eval`` for safety.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        if "/" in s:
+            num, den = s.split("/", 1)
+            den_f = float(den)
+            if den_f == 0:
+                return None
+            return float(num) / den_f
+        return float(s)
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
 def _duration_str_to_sec(time_str):
-    """Parse ``HH:MM:SS[.ms]`` strings (as found in some container tags)."""
+    """Parse ``HH:MM:SS.ms`` durations into seconds. Returns ``None`` on failure."""
     if time_str is None:
         return None
     try:
-        h, m, s = time_str.split(':')
+        h, m, s = str(time_str).split(":")
         return int(h) * 3600 + int(m) * 60 + float(s)
     except Exception:
         logger.warning("Unsupported duration string: %r", time_str)
         return None
 
 
-def _safe_float(value):
-    if value is None:
-        return None
+def _run_ffprobe(filepath: str) -> dict:
+    """Invoke ``ffprobe`` and return the parsed JSON. Raises on non-zero exit."""
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-hide_banner",
+        "-select_streams", "v:0",
+        "-count_frames",
+        "-count_packets",
+        "-show_format",
+        "-show_streams",
+        "-print_format", "json",
+        filepath,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, check=False)
+    if proc.returncode != 0:
+        stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"ffprobe failed (rc={proc.returncode}): {stderr}")
     try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+        return json.loads(proc.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise RuntimeError(f"ffprobe returned invalid JSON: {e}") from e
 
 
-def _fraction_to_float(value):
-    """Convert PyAV's ``Fraction`` (or any number) to a float; None on failure."""
-    if value is None:
-        return None
-    if isinstance(value, Fraction):
-        if value.denominator == 0:
-            return None
-        return float(value)
-    return _safe_float(value)
+def _clean_stream_dict(stream: dict) -> dict:
+    """Strip noisy/non-stable fields from the ffprobe stream dict (in place)."""
+    for key in ("index", "nb_read_frames", "nb_read_packets"):
+        stream.pop(key, None)
+    return stream
 
 
-# ---------------------------------------------------------------------------
-# PyAV → ffprobe-compatible dicts (kept so downstream consumers of
-# ``metadata.system.ffmpeg`` / ``metadata.system.format`` keep working)
-# ---------------------------------------------------------------------------
+def _validate_video(fps, duration, r_frames, default_start_time=0):
+    """Verify ``r_frames`` matches ``fps * (duration - start_time)``.
 
-def _ratio_str(value):
-    """Format a rational number the way ffprobe does in its JSON output.
-
-    PyAV exposes frame rates and time bases as :class:`fractions.Fraction`
-    objects (e.g. ``Fraction(30000, 1001)``), but ffprobe emits them as the
-    string ``"num/den"`` (e.g. ``"30000/1001"``). Downstream consumers of
-    ``metadata.system.ffmpeg`` expect that string form, so this helper:
-
-    * returns ``None`` for ``None`` (so callers can drop the field entirely),
-    * formats a ``Fraction`` as ``"<numerator>/<denominator>"``,
-    * falls back to ``str(value)`` for plain ints/floats.
+    Returns ``(ok: bool, expected_frames: int, detail: dict)``. When values are
+    missing the check is treated as a pass with an empty detail dict.
     """
-    if value is None:
-        return None
-    if isinstance(value, Fraction):
-        return f"{value.numerator}/{value.denominator}"
-    return str(value)
+    if not (fps and duration and r_frames):
+        return True, 0, {}
+    if default_start_time is None:
+        default_start_time = 0
 
+    exp_frames_count = fps * float(int((duration - default_start_time) * 100)) / 100
+    full_exp_frames_count = fps * float(duration - default_start_time)
+    rounded = round(exp_frames_count)
+    rounded_up = math.floor(exp_frames_count) + 1
 
-def _build_stream_dict(video_stream) -> dict:
-    """Build an ffprobe-style dict describing a single video stream.
+    if rounded == rounded_up or rounded == r_frames:
+        exp_frames = rounded
+    else:
+        exp_frames = rounded_up
 
-    The legacy service used to shell out to ``ffprobe`` and store the first
-    entry of its ``streams[]`` array on the item under
-    ``metadata.system.ffmpeg``. This service uses PyAV instead, so we rebuild
-    the same dict by hand from a PyAV :class:`av.video.stream.VideoStream`
-    object.
-
-    Field mapping (PyAV source → ffprobe key):
-
-    * ``codec_context.name`` / ``.long_name`` / ``.pix_fmt`` →
-      ``codec_name`` / ``codec_long_name`` / ``pix_fmt``.
-    * ``video_stream.width`` / ``.height`` → ``width`` / ``height``.
-    * ``video_stream.average_rate`` → ``avg_frame_rate`` (``"num/den"``).
-    * ``video_stream.base_rate`` → ``r_frame_rate`` (``"num/den"``).
-    * ``video_stream.time_base`` → ``time_base`` (``"num/den"``).
-    * ``start_time`` / ``duration``: PyAV stores these as integer ticks in
-      the stream's ``time_base`` units, so we multiply by ``time_base`` to
-      get seconds, then stringify (ffprobe emits these as strings).
-    * ``video_stream.frames`` → ``nb_frames`` (stringified, omitted if 0).
-    * ``video_stream.metadata`` → ``tags`` (container-level stream tags).
-
-    Notes:
-    * ``index``, ``nb_read_frames`` and ``nb_read_packets`` are intentionally
-      omitted to match the Rubiks spec — those fields are either
-      meaningless without a full decode pass or not part of the contract.
-    * Any field that resolves to ``None`` is dropped from the returned dict,
-      matching ffprobe's behaviour of omitting unknown fields rather than
-      emitting nulls.
-    """
-    codec_ctx = video_stream.codec_context
-    avg_rate = video_stream.average_rate
-    base_rate = video_stream.base_rate
-
-    start_time_sec = None
-    if video_stream.start_time is not None and video_stream.time_base is not None:
-        start_time_sec = float(video_stream.start_time * video_stream.time_base)
-
-    duration_sec = None
-    if video_stream.duration is not None and video_stream.time_base is not None:
-        duration_sec = float(video_stream.duration * video_stream.time_base)
-
-    stream = {
-        'codec_name': getattr(codec_ctx, 'name', None),
-        'codec_long_name': getattr(codec_ctx, 'long_name', None),
-        'codec_type': 'video',
-        'width': video_stream.width,
-        'height': video_stream.height,
-        'pix_fmt': getattr(codec_ctx, 'pix_fmt', None),
-        'avg_frame_rate': _ratio_str(avg_rate),
-        'r_frame_rate': _ratio_str(base_rate),
-        'time_base': _ratio_str(video_stream.time_base),
-        'start_time': str(start_time_sec) if start_time_sec is not None else None,
-        'duration': str(duration_sec) if duration_sec is not None else None,
-        'nb_frames': str(video_stream.frames) if video_stream.frames else None,
-        'tags': dict(video_stream.metadata or {}),
-    }
-    # Drop None values to keep parity with ffprobe which omits unknown fields.
-    return {k: v for k, v in stream.items() if v is not None}
-
-
-def _build_format_dict(container, filepath: str) -> dict:
-    """Build an ffprobe-style dict describing the media container.
-
-    Where :func:`_build_stream_dict` describes a single elementary stream
-    (the video track), this helper describes the **container** that wraps
-    all streams — the equivalent of ffprobe's top-level ``format`` object.
-    The result is stored on the item under ``metadata.system.format`` so
-    legacy consumers of that key keep working after the migration from a
-    subprocess ``ffprobe`` call to PyAV.
-
-    Field mapping (PyAV source → ffprobe key):
-
-    * ``filepath`` → ``filename`` (path the container was opened from).
-    * ``len(container.streams)`` → ``nb_streams`` (total stream count, not
-      just video; includes audio, subtitles, data, etc.).
-    * ``container.format.name`` / ``.long_name`` → ``format_name`` /
-      ``format_long_name`` (e.g. ``"mov,mp4,m4a,3gp,3g2,mj2"``).
-    * ``container.duration`` → ``duration``. PyAV stores container
-      duration in microseconds via the global ``av.time_base`` (``1e6``),
-      not the per-stream ``time_base`` used in :func:`_build_stream_dict`,
-      so we divide instead of multiply to get seconds.
-    * ``container.bit_rate`` → ``bit_rate`` (overall bitrate, bits/sec).
-    * ``container.size`` → ``size`` (file size in bytes, if available).
-    * ``container.metadata`` → ``tags`` (container-level tags such as
-      ``title``, ``encoder``, ``creation_time``).
-
-    All numeric fields are stringified to match ffprobe's JSON output, and
-    keys whose value is ``None`` / falsy are dropped so the resulting dict
-    mirrors ffprobe's "omit unknown fields" behaviour.
-    """
-    duration_sec = None
-    if container.duration is not None:
-        duration_sec = container.duration / av.time_base
-
-    fmt = {
-        'filename': filepath,
-        'nb_streams': len(container.streams),
-        'format_name': getattr(container.format, 'name', None),
-        'format_long_name': getattr(container.format, 'long_name', None),
-        'duration': str(duration_sec) if duration_sec is not None else None,
-        'bit_rate': str(container.bit_rate) if container.bit_rate else None,
-        'size': str(container.size) if getattr(container, 'size', None) else None,
-        'tags': dict(container.metadata or {}),
-    }
-    return {k: v for k, v in fmt.items() if v is not None}
+    if exp_frames != r_frames and abs(exp_frames_count - r_frames) > 0.5:
+        return False, exp_frames, {
+            "type": "origExpectedFrames",
+            "message": "Frames is not equal to FPS * (Duration - StartTime)",
+            "expected_frames": exp_frames,
+            "actual_frames": r_frames,
+            "delta": abs(full_exp_frames_count - r_frames),
+        }
+    return True, exp_frames, {}
 
 
 # ---------------------------------------------------------------------------
@@ -247,311 +181,387 @@ def _build_format_dict(container, filepath: str) -> dict:
 # ---------------------------------------------------------------------------
 
 class VideoPreprocess(dl.BaseServiceRunner):
+    """Unified video preprocess: ffprobe metadata + OpenCV/imageio thumbnail."""
 
-    # ---------------------------------------------------------------- entry points
-    def on_create(self, item: dl.Item):
-        """Run metadata extraction and/or thumbnail generation on a video item."""
+    def __init__(self):
+        self.ignored_datasets = self._load_ignore_list()
+        logger.info(
+            "VideoPreprocess initialized: %d ignored datasets",
+            len(self.ignored_datasets),
+        )
 
-        if not EXTRACT_METADATA and not EXTRACT_THUMBNAIL:
-            logger.info('Both stages disabled — skipping item %s', item.id)
+    # ---- init helpers ----------------------------------------------------
+
+    @staticmethod
+    def _load_ignore_list() -> list:
+        """Load per-service dataset ignore list from the DataloopTasks binaries dataset."""
+        try:
+            project = dl.projects.get(project_name="DataloopTasks")
+            b_dataset = project.datasets._get_binaries_dataset()
+            item = b_dataset.items.get(filepath="/preprocess_ignore_list.json")
+            with open(item.download(), "r") as f:
+                ignore_list = json.load(f)
+            entries = ignore_list.get(IGNORE_LIST_SERVICE_KEY, [])
+            return [
+                e["dataset_id"]
+                for e in entries
+                if isinstance(e, dict) and "dataset_id" in e
+            ]
+        except dl.exceptions.NotFound:
+            logger.warning("Ignore list file not found; using empty list")
+            return []
+        except Exception:
+            logger.error("Failed loading ignore list:\n%s", traceback.format_exc())
+            return []
+
+    # ---- entry points ----------------------------------------------------
+
+    def on_create(self, item: dl.Item, context: dl.Context = None,
+                  progress: dl.Progress = None) -> dl.Item:
+        """Main trigger entry point.
+
+        Reads ``context.trigger_input`` for per-invocation config, falling back
+        to module-level constants. Stages run in this order: metadata then
+        thumbnail. Errors during a stage are recorded with ``record_etl_error``
+        and re-raised so the service execution is marked failed.
+        """
+        trigger_input = {}
+        if context is not None and hasattr(context, "trigger_input"):
+            trigger_input = context.trigger_input or {}
+
+        metadata_only = bool(trigger_input.get("metadata_only", False))
+        thumbnail_only = bool(trigger_input.get("thumbnail_only", False))
+        thumbnail_size = int(trigger_input.get("thumbnail_size", DEFAULT_THUMB_SIZE))
+        max_file_size_mb = int(trigger_input.get("max_file_size_mb", MAX_FILE_SIZE_MB))
+
+        logger.info(
+            "on_create item=%s metadata_only=%s thumbnail_only=%s "
+            "thumbnail_size=%d max_file_size_mb=%d",
+            item.id, metadata_only, thumbnail_only, thumbnail_size, max_file_size_mb,
+        )
+
+        if metadata_only and thumbnail_only:
+            logger.warning(
+                "item=%s: conflicting flags (metadata_only AND thumbnail_only) — skipping",
+                item.id,
+            )
             return item
 
-        workdir = item.id
-        os.makedirs(workdir, exist_ok=True)
+        do_metadata = not thumbnail_only
+        do_thumbnail = not metadata_only
+        if not do_metadata and not do_thumbnail:
+            logger.info("item=%s: nothing to do (both stages disabled)", item.id)
+            return item
+
+        # Dataset-level skips.
+        if item.datasetId in self.ignored_datasets:
+            logger.info(
+                "item=%s: dataset %s is in ignore list — skipping",
+                item.id, item.datasetId,
+            )
+            return item
         try:
+            dataset = item.dataset
+            if dataset.metadata.get("system", {}).get(SKIP_DATASET_FLAG, False):
+                logger.info(
+                    "item=%s: dataset %s has %s=True — skipping",
+                    item.id, item.datasetId, SKIP_DATASET_FLAG,
+                )
+                return item
+        except Exception:
+            # If dataset metadata isn't readable, proceed with processing.
+            pass
+
+        # File-size guard (uses platform-reported size to avoid downloading huge files).
+        file_size = item.metadata.get("system", {}).get("size", 0) or 0
+        if file_size and file_size > max_file_size_mb * 1024 * 1024:
+            msg = f"File too large: {file_size} bytes exceeds {max_file_size_mb}MB limit"
+            logger.error("item=%s: %s", item.id, msg)
+            record_etl_error(item, "size_check", msg, failed=True)
+            item.update(system_metadata=True)
+            raise ValueError(msg)
+
+        workdir = None
+        try:
+            workdir = item.id
+            os.makedirs(workdir, exist_ok=True)
             filepath = item.download(local_path=workdir)
-            if EXTRACT_METADATA:
-                item = self._extract_and_write_metadata(item=item, filepath=filepath)
-            if EXTRACT_THUMBNAIL:
-                item = self._generate_thumbnail(item=item, filepath=filepath, workdir=workdir)
+
+            if do_metadata:
+                self._extract_and_write_metadata(item, filepath)
+            if do_thumbnail:
+                self._generate_thumbnail(item, filepath, workdir, thumbnail_size)
+
             return item
         except Exception as e:
-            # Already recorded by the inner stage handlers, but make sure the
-            # top-level failure is visible too.
-            tb = traceback.format_exc()
-            logger.error('on_create failed for %s: %s\n%s', item.id, e, tb)
-            record_etl_error(item, stage='on_create', error=str(e),
-                             failed=True)
-            item.update(system_metadata=True)
+            # Inner stages already recorded their own errors; this catches anything
+            # else (download failure, OS errors, etc.) so the item shows the cause.
+            if not item.metadata.get("system", {}).get("etl", {}).get("failed"):
+                record_etl_error(item, "on_create", str(e), failed=True)
+                try:
+                    item.update(system_metadata=True)
+                except Exception:
+                    logger.exception("item=%s: failed to persist on_create error", item.id)
             raise
         finally:
-            if os.path.isdir(workdir):
+            if workdir is not None and os.path.isdir(workdir):
                 shutil.rmtree(workdir, ignore_errors=True)
 
     @staticmethod
-    def on_delete(item: dl.Item):
-        """Clean up the thumbnail item and any webm modality on item delete."""
-        header = f'[video-preprocess][on_delete][{item.id}]'
-        thumbnail_id = item.metadata.get('system', {}).get('thumbnailId')
+    def on_delete(item: dl.Item) -> None:
+        """Mirror of the legacy on_delete: clean up thumbnail item and webm modality."""
+        log_header = f"[video-preprocess][on_delete][{item.id}]"
+
+        thumbnail_id = item.metadata.get("system", {}).get("thumbnailId")
         if thumbnail_id is not None:
-            logger.info('%s deleting thumbnail id %s', header, thumbnail_id)
+            logger.info("%s deleting thumbnail id=%s", log_header, thumbnail_id)
             try:
                 dl.items.get(item_id=thumbnail_id).delete()
+                logger.info("%s thumbnail deleted", log_header)
             except dl.exceptions.NotFound:
-                logger.info('%s thumbnail already deleted', header)
+                logger.info("%s thumbnail already deleted", log_header)
 
-        if 'webm' not in (item.mimetype or ''):
-            modalities = item.metadata.get('system', {}).get('modalities', []) or []
-            expected_name = item.id + '.webm'
+        if "webm" not in (item.mimetype or ""):
+            modalities = item.metadata.get("system", {}).get("modalities", []) or []
+            expected_name = item.id + ".webm"
+            webm_id = None
             for modality in modalities:
-                if (modality.get('type') == 'replace'
-                        and modality.get('name') == expected_name):
-                    webm_id = modality.get('ref')
-                    if webm_id is None:
-                        continue
-                    logger.info('%s deleting webm id %s', header, webm_id)
-                    try:
-                        dl.items.delete(item_id=webm_id)
-                    except dl.exceptions.NotFound:
-                        logger.info('%s webm already deleted', header)
+                if (modality.get("type") == "replace"
+                        and modality.get("name") == expected_name):
+                    webm_id = modality.get("ref")
                     break
+            if webm_id is not None:
+                logger.info("%s deleting webm id=%s", log_header, webm_id)
+                try:
+                    dl.items.delete(item_id=webm_id)
+                    logger.info("%s webm deleted", log_header)
+                except dl.exceptions.NotFound:
+                    logger.info("%s webm already deleted", log_header)
 
-    # ----------------------------------------------------- metadata extraction
-    def _extract_and_write_metadata(self, item: dl.Item, filepath: str) -> dl.Item:
+    # ---- stage: metadata -------------------------------------------------
+
+    def _extract_and_write_metadata(self, item: dl.Item, filepath: str) -> None:
+        """Run ffprobe, populate item.metadata, validate frame count.
+
+        On validation failure or any extraction error, records ``failed=True``
+        on the item and re-raises so the service execution is marked failed.
+        """
         try:
-            metadata = self._extract_metadata(filepath=filepath)
+            probe = _run_ffprobe(filepath)
         except Exception as e:
-            record_etl_error(item, stage='metadata', error=str(e),
-                             failed=True)
+            logger.exception("item=%s: ffprobe failed", item.id)
+            record_etl_error(item, "metadata", str(e), failed=True)
             item.update(system_metadata=True)
             raise
 
-        return self._write_metadata_to_item(item=item, metadata=metadata)
-
-    @staticmethod
-    def _extract_metadata(filepath: str) -> dict:
-        """Read all needed metadata via PyAV."""
-        container = av.open(filepath)
         try:
-            if not container.streams.video:
-                raise ValueError('video stream data is empty')
-            video_stream = container.streams.video[0]
+            video_stream = next(
+                (s for s in probe.get("streams", []) if s.get("codec_type") == "video"),
+                None,
+            )
+            if video_stream is None:
+                raise ValueError(f"video stream data is empty for: {filepath}")
 
-            start_time = None
-            if video_stream.start_time is not None and video_stream.time_base is not None:
-                try:
-                    start_time = float(video_stream.start_time * video_stream.time_base)
-                except Exception:
-                    start_time = None
+            video_format = probe.get("format") or {}
+            nb_streams = video_format.get("nb_streams", 1)
+
+            start_time = _safe_parse_fraction(video_stream.get("start_time"))
             if start_time is None:
-                start_time = 0.0
+                start_time = 0
 
-            height = video_stream.height
-            width = video_stream.width
-            fps = _fraction_to_float(video_stream.average_rate)
+            height = video_stream.get("height")
+            width = video_stream.get("width")
 
-            # Duration: stream → tags.DURATION → container.duration
-            duration = None
-            if video_stream.duration is not None and video_stream.time_base is not None:
-                try:
-                    duration = float(video_stream.duration * video_stream.time_base)
-                except Exception:
-                    duration = None
+            fps = _safe_parse_fraction(
+                video_stream.get("avg_frame_rate")
+                or video_stream.get("r_frame_rate")
+            )
+
+            nb_frames_raw = video_stream.get("nb_frames")
+            nb_frames = int(nb_frames_raw) if nb_frames_raw is not None else None
+
+            nb_read_frames_raw = video_stream.get("nb_read_frames")
+            nb_read_frames = (
+                int(nb_read_frames_raw) if nb_read_frames_raw is not None else None
+            )
+
+            # Duration fallback chain: stream → stream.tags.DURATION → format.
+            duration = _safe_parse_fraction(video_stream.get("duration"))
             if duration is None:
                 duration = _duration_str_to_sec(
-                    (video_stream.metadata or {}).get('DURATION'))
-            if duration is None and container.duration is not None:
-                duration = container.duration / av.time_base
+                    video_stream.get("tags", {}).get("DURATION")
+                )
+            if duration is None:
+                duration = _safe_parse_fraction(video_format.get("duration"))
 
-            nb_frames = video_stream.frames or None
-            nb_streams = len(container.streams) or 1
+            # ffmpeg compat dict (cleaned stream).
+            ffmpeg_dict = _clean_stream_dict(dict(video_stream))
 
-            stream_dict = _build_stream_dict(video_stream)
-            format_dict = _build_format_dict(container, filepath)
+            # Persist to item.metadata.system
+            system = item.metadata.setdefault("system", {})
+            system["ffmpeg"] = ffmpeg_dict
+            system["format"] = video_format
+            system["startTime"] = start_time
+            if height is not None:
+                system["height"] = height
+            if width is not None:
+                system["width"] = width
+            if fps is not None:
+                system["fps"] = fps
+            if duration is not None:
+                system["duration"] = float(duration)
+            system["nb_frames"] = nb_frames
+            system["nb_streams"] = nb_streams
 
-            return {
-                'ffmpeg': stream_dict,
-                'format': format_dict,
-                'startTime': start_time,
-                'height': height,
-                'width': width,
-                'fps': fps,
-                'duration': duration,
-                'nb_frames': nb_frames,
-                'nb_streams': nb_streams,
-            }
-        finally:
-            container.close()
+            # Backward-compat top-level fields.
+            item.metadata["startTime"] = start_time
+            if fps is not None:
+                item.metadata["fps"] = fps
 
-    def _write_metadata_to_item(self, item: dl.Item, metadata: dict) -> dl.Item:
-        system = item.metadata.setdefault('system', {})
+            # Validation: prefer read frame count (more accurate when counted).
+            r_frames = nb_read_frames if nb_read_frames is not None else nb_frames
+            ok, exp_frames, detail = _validate_video(
+                fps=fps,
+                duration=duration,
+                r_frames=r_frames,
+                default_start_time=start_time,
+            )
+            if not ok:
+                err_msg = (
+                    f"frames validation failed: expected={exp_frames} actual={r_frames}"
+                )
+                logger.error("item=%s: %s", item.id, err_msg)
+                record_etl_error(item, "validation", err_msg, failed=True)
+                item.update(system_metadata=True)
+                raise ValueError(err_msg)
 
-        if 'ffmpeg' in metadata:
-            system['ffmpeg'] = metadata['ffmpeg']
-        if 'format' in metadata:
-            system['format'] = metadata['format']
+            # Required-field check (catches missing critical metadata).
+            missing = [
+                k for k in VALIDATION_KEYS
+                if not system.get(k) and k != "ffmpeg"
+            ]
+            if "ffmpeg" not in system or not system["ffmpeg"]:
+                missing.append("ffmpeg")
+            if missing:
+                err_msg = f"missing metadata values: {missing}"
+                logger.error("item=%s: %s", item.id, err_msg)
+                record_etl_error(item, "metadata", err_msg, failed=True)
+                item.update(system_metadata=True)
+                raise ValueError(err_msg)
 
-        system['startTime'] = metadata.get('startTime', 0)
-        # Backward compat fields outside system.
-        item.metadata['startTime'] = system['startTime']
-
-        system['height'] = metadata.get('height')
-        system['width'] = metadata.get('width')
-        system['fps'] = metadata.get('fps')
-        item.metadata['fps'] = system['fps']
-
-        system['duration'] = metadata.get('duration')
-        # Always include nb_frames (nullable) to match the Rubiks spec.
-        system['nb_frames'] = metadata.get('nb_frames')
-        system['nb_streams'] = metadata.get('nb_streams', 1)
-
-        # Run validation. On mismatch: record + raise.
-        ok, exp_frames, _ = self._validate_video(
-            fps=metadata.get('fps'),
-            duration=metadata.get('duration'),
-            r_frames=metadata.get('nb_frames'),
-            default_start_time=metadata.get('startTime'),
-        )
-        if not ok:
-            record_etl_error(item,
-                             stage='validation',
-                             error='frames count does not match fps * duration',
-                             failed=True)
             item.update(system_metadata=True)
-            raise ValueError(
-                'frames validation failed: expected={} actual={}'.format(
-                    exp_frames, metadata.get('nb_frames')))
+            logger.info(
+                "item=%s metadata persisted: %dx%d fps=%s duration=%s nb_frames=%s",
+                item.id, width or 0, height or 0, fps, duration, nb_frames,
+            )
+        except Exception as e:
+            # Avoid double-recording validation errors (already recorded above).
+            if not item.metadata.get("system", {}).get("etl", {}).get("failed"):
+                logger.exception("item=%s: metadata stage failed", item.id)
+                record_etl_error(item, "metadata", str(e), failed=True)
+                try:
+                    item.update(system_metadata=True)
+                except Exception:
+                    logger.exception("item=%s: failed to persist metadata error", item.id)
+            raise
 
-        # Check that the core values we depend on are populated.
-        missing = [k for k in _VALIDATION_FIELDS if not system.get(k)]
-        if missing:
-            record_etl_error(item,
-                             stage='metadata',
-                             error='missing metadata values: {}'.format(missing),
-                             failed=True)
-            item.update(system_metadata=True)
-            raise ValueError('missing metadata values: {}'.format(missing))
+    # ---- stage: thumbnail ------------------------------------------------
 
-        return item.update(system_metadata=True)
-
-    @staticmethod
-    def _validate_video(fps, duration, r_frames, default_start_time=0):
-        """Validate frame count against fps * (duration - start_time).
-
-        Returns ``(ok, expected_frames, detail_dict)``.
-        ``ok=True`` when any of the inputs is missing — we only flag mismatches
-        when we have all three values.
-        """
-        if not (fps and duration and r_frames):
-            return True, 0, {}
-
-        if default_start_time is None:
-            default_start_time = 0
-
-        exp_frames_count = fps * float(int((duration - default_start_time) * 100)) / 100
-        full_exp_frames_count = fps * float(duration - default_start_time)
-        rounded = round(exp_frames_count)
-        rounded_up = math.floor(exp_frames_count) + 1
-
-        if rounded == rounded_up or rounded == r_frames:
-            exp_frames = rounded
-        else:
-            exp_frames = rounded_up
-
-        if exp_frames != r_frames and abs(exp_frames_count - r_frames) > 0.5:
-            return False, exp_frames, {
-                'delta': abs(full_exp_frames_count - r_frames),
-            }
-        return True, exp_frames, {}
-
-    # ----------------------------------------------------- thumbnail generation
-    def _generate_thumbnail(self, item: dl.Item, filepath: str, workdir: str) -> dl.Item:
-        gif_filepath = os.path.join(workdir, '{}.gif'.format(item.id))
+    def _generate_thumbnail(self, item: dl.Item, filepath: str, workdir: str,
+                            thumbnail_size: int) -> None:
+        """Create a short GIF preview and upload it to /.dataloop/thumbnails."""
         try:
-            size_mb = os.path.getsize(filepath) / (1024 * 1024)
-            if size_mb > MAX_GEN_THUMB_SIZE_MB:
-                msg = ('file size {:.2f}MB exceeds MAX_GEN_THUMB_SIZE_MB={}'
-                       .format(size_mb, MAX_GEN_THUMB_SIZE_MB))
-                record_etl_error(item, stage='thumbnail_size', error=msg,
-                                 failed=True)
+            file_size = (
+                os.path.getsize(filepath) if os.path.isfile(filepath) else 0
+            )
+            if file_size > MAX_GEN_THUMB_SIZE_MB * 1024 * 1024:
+                msg = (
+                    f"File too large for thumbnail: {file_size} bytes "
+                    f"exceeds {MAX_GEN_THUMB_SIZE_MB}MB limit"
+                )
+                logger.error("item=%s: %s", item.id, msg)
+                record_etl_error(item, "thumbnail_size", msg, failed=True)
                 item.update(system_metadata=True)
                 raise ValueError(msg)
 
-            self._build_gif(filepath=filepath, output_filepath=gif_filepath)
+            gif_filepath = os.path.join(workdir, f"{item.id}.gif")
+            self._build_gif(filepath, gif_filepath, thumbnail_size)
 
             dataset = dl.datasets.get(dataset_id=item.datasetId, fetch=False)
             thumbnail_item = dataset.items.upload(
                 local_path=gif_filepath,
-                remote_path='/.dataloop/thumbnails',
+                remote_path="/.dataloop/thumbnails",
+                remote_name=f"{item.id}.gif",
                 overwrite=True,
+                item_metadata={"system": {"thumbnailOf": item.id}},
             )
 
-            # Mark the thumbnail as belonging to the source item.
-            thumb_sys = thumbnail_item.metadata.setdefault('system', {})
-            thumb_sys['thumbnailOf'] = item.id
-            try:
-                thumbnail_item.update(system_metadata=True)
-            except Exception:
-                logger.exception('Failed to set thumbnailOf on %s', thumbnail_item.id)
-
-            item.metadata.setdefault('system', {})['thumbnailId'] = thumbnail_item.id
-            return item.update(system_metadata=True)
+            item.metadata.setdefault("system", {})["thumbnailId"] = thumbnail_item.id
+            item.update(system_metadata=True)
+            logger.info(
+                "item=%s thumbnail uploaded: id=%s",
+                item.id, thumbnail_item.id,
+            )
         except Exception as e:
-            # ``thumbnail_size`` already recorded above; only record here when we
-            # don't already have an etl entry for this run.
-            if not isinstance(e, ValueError) or 'MAX_GEN_THUMB_SIZE_MB' not in str(e):
-                record_etl_error(item, stage='thumbnail', error=str(e),
-                                 failed=True)
-                item.update(system_metadata=True)
+            if not item.metadata.get("system", {}).get("etl", {}).get("failed"):
+                logger.exception("item=%s: thumbnail stage failed", item.id)
+                record_etl_error(item, "thumbnail", str(e), failed=True)
+                try:
+                    item.update(system_metadata=True)
+                except Exception:
+                    logger.exception("item=%s: failed to persist thumbnail error", item.id)
             raise
 
     @staticmethod
-    def _build_gif(filepath: str, output_filepath: str) -> None:
-        """Decode the first ``THUMB_DURATION_SEC`` of video and write a GIF.
-
-        Resizes each frame so the longest edge equals ``DEFAULT_THUMB_SIZE``,
-        preserving aspect ratio (no square crop / stretch).
-        """
-        cap = cv2.VideoCapture(filepath)
-        if not cap.isOpened():
-            raise RuntimeError('cv2.VideoCapture could not open: {}'.format(filepath))
+    def _build_gif(src_filepath: str, dst_filepath: str, thumb_size: int) -> None:
+        """Decode the first ``THUMB_DURATION_SEC`` seconds and write a GIF."""
+        cap = cv2.VideoCapture(src_filepath)
         try:
-            fps = cap.get(cv2.CAP_PROP_FPS) or 0
-            frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+            if not cap.isOpened():
+                raise RuntimeError(f"cv2.VideoCapture failed to open: {src_filepath}")
 
+            fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+            frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0
             if fps <= 0:
-                raise RuntimeError('invalid fps from cv2: {}'.format(fps))
+                raise RuntimeError(f"invalid fps reported by OpenCV: {fps}")
 
             length_sec = min(THUMB_DURATION_SEC, frame_count / fps) if frame_count else THUMB_DURATION_SEC
-            new_fps = max(fps * 0.25, 1.0)
-            frames_in_window = max(int(length_sec * new_fps), 1)
+            new_fps = fps * THUMB_SPEED_FACTOR
+            target_frame_count = max(int(length_sec * new_fps), 1)
 
-            # Stride so we end up with roughly ``frames_in_window`` frames.
-            target_total = max(frame_count * 0.1, frames_in_window) if frame_count else frames_in_window
-            interval = round(max(min(int(target_total / frames_in_window),
-                                     fps / 3), 4))
-            interval = max(int(interval), 1)
+            # Sampling interval ensures we get roughly ``target_frame_count`` frames
+            # from within the first ``length_sec`` seconds of source video.
+            source_frames_in_window = max(int(length_sec * fps), 1)
+            interval = max(source_frames_in_window // target_frame_count, 1)
 
-            frames = []
+            frames_rgb = []
             i = 0
-            while True:
+            while len(frames_rgb) < target_frame_count:
                 ret, frame = cap.read()
-                if not ret or len(frames) >= frames_in_window:
+                if not ret:
                     break
                 if i % interval == 0:
-                    resized = _resize_keep_aspect(frame, DEFAULT_THUMB_SIZE)
-                    frames.append(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB))
+                    resized = _resize_keep_aspect(frame, thumb_size)
+                    frames_rgb.append(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB))
                 i += 1
+
+            if not frames_rgb:
+                raise RuntimeError("no frames decoded for thumbnail")
+
+            imageio.mimsave(dst_filepath, frames_rgb, fps=max(new_fps, 1.0))
         finally:
             cap.release()
 
-        if not frames:
-            raise RuntimeError('no frames decoded for thumbnail')
 
-        imageio.mimsave(output_filepath, frames, fps=new_fps)
-
-
-def _resize_keep_aspect(frame: np.ndarray, max_edge: int) -> np.ndarray:
-    """Resize ``frame`` so the longest edge equals ``max_edge``.
-
-    Aspect ratio is preserved; small frames are still scaled down only if their
-    longest edge exceeds ``max_edge``.
-    """
+def _resize_keep_aspect(frame, longest_edge: int):
+    """Resize ``frame`` so the longest edge equals ``longest_edge`` (aspect preserved)."""
     h, w = frame.shape[:2]
-    longest = max(h, w)
-    if longest <= max_edge:
+    if max(h, w) <= longest_edge:
         return frame
-    scale = max_edge / float(longest)
-    new_w = max(int(round(w * scale)), 1)
-    new_h = max(int(round(h * scale)), 1)
+    if w >= h:
+        new_w = longest_edge
+        new_h = max(int(round(h * (longest_edge / w))), 1)
+    else:
+        new_h = longest_edge
+        new_w = max(int(round(w * (longest_edge / h))), 1)
     return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
