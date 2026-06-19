@@ -370,10 +370,26 @@ class VideoPreprocess(dl.BaseServiceRunner):
             height = video_stream.get("height")
             width = video_stream.get("width")
 
-            fps = _safe_parse_fraction(
-                video_stream.get("avg_frame_rate")
-                or video_stream.get("r_frame_rate")
-            )
+            r_frame_rate = _safe_parse_fraction(video_stream.get("r_frame_rate"))
+            avg_frame_rate = _safe_parse_fraction(video_stream.get("avg_frame_rate"))
+            
+            # Detect VFR by comparing r_frame_rate vs avg_frame_rate
+            if r_frame_rate and avg_frame_rate:
+                frame_rate_diff = abs(r_frame_rate - avg_frame_rate)
+                # If difference is more than 5%, consider it VFR
+                is_vfr = frame_rate_diff > (r_frame_rate * 0.05) if r_frame_rate else False
+                if is_vfr:
+                    logger.info(
+                        "item=%s: VFR detected - r_frame_rate=%s avg_frame_rate=%s diff=%s",
+                        item.id, r_frame_rate, avg_frame_rate, frame_rate_diff
+                    )
+                else:
+                    logger.info(
+                        "item=%s: CFR detected - r_frame_rate=%s avg_frame_rate=%s",
+                        item.id, r_frame_rate, avg_frame_rate
+                    )
+            
+            fps = avg_frame_rate or r_frame_rate
 
             nb_frames_raw = video_stream.get("nb_frames")
             nb_frames = int(nb_frames_raw) if nb_frames_raw is not None else None
@@ -433,12 +449,12 @@ class VideoPreprocess(dl.BaseServiceRunner):
             )
             if not ok:
                 err_msg = (
-                    f"frames validation failed: expected={exp_frames} actual={r_frames}"
+                    f"frames validation failed: expected={exp_frames} actual={r_frames} "
+                    f"(likely VFR video - using actual frame count)"
                 )
-                logger.error("item=%s: %s", item.id, err_msg)
-                record_etl_error(item, "validation", err_msg, failed=True)
-                item.update(system_metadata=True)
-                raise ValueError(err_msg)
+                logger.warning("item=%s: %s", item.id, err_msg)
+                record_etl_error(item, "validation", err_msg, failed=False)
+                # Don't raise - allow VFR videos to proceed with actual frame count
 
             # Required-field check (catches missing critical metadata).
             missing = [

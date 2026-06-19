@@ -1,12 +1,12 @@
 {
-    "name": "video-preprocess-husam",
-    "displayName": "Video Preprocess husam",
+    "name": "video-preprocess-app",
+    "displayName": "Video Preprocess App",
     "description": "Unified Video Preprocess Application - metadata extraction and thumbnail generation",
     "Application Type": ["Preprocess"],
     "attributes": {
         "Provider": "Dataloop"
     },
-    "version": "1.0.8",
+    "version": "1.0.10",
     "scope": "project",
     "components": {
         "modules": [
@@ -59,7 +59,7 @@
         ],
         "services": [
             {
-                "name": "video-preprocess-husam",
+                "name": "video-preprocess-app",
                 "moduleName": "video_preprocess_module",
                 "runtime": {
                     "podType": "regular-m",
@@ -82,11 +82,11 @@
         ],
         "triggers": [
             {
-                "name": "video-preprocess-created-husam",
+                "name": "video-preprocess-created-app",
                 "active": true,
                 "type": "Event",
                 "scope": "system",
-                "namespace": "services.video-preprocess-husam",
+                "namespace": "services.video-preprocess-app",
                 "spec": {
                     "resource": "Item",
                     "actions": [
@@ -154,11 +154,11 @@
                 }
             },
             {
-                "name": "video-preprocess-deleted-husam",
+                "name": "video-preprocess-app-deleted",
                 "active": true,
                 "type": "Event",
                 "scope": "system",
-                "namespace": "services.video-preprocess-husam",
+                "namespace": "services.video-preprocess-app",
                 "spec": {
                     "resource": "Item",
                     "actions": [
