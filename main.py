@@ -138,9 +138,7 @@ def _run_ffprobe(filepath: str) -> dict:
 
 
 def _clean_stream_dict(stream: dict) -> dict:
-    """Strip noisy/non-stable fields from the ffprobe stream dict (in place)."""
-    for key in ("index", "nb_read_frames", "nb_read_packets"):
-        stream.pop(key, None)
+    """Clean the ffprobe stream dict (in place)."""
     return stream
 
 
@@ -185,6 +183,10 @@ class VideoPreprocess(dl.BaseServiceRunner):
 
     def __init__(self):
         self.ignored_datasets = self._load_ignore_list()
+        self.item: dl.Item | None = None
+        self.filepath: str | None = None
+        self.workdir: str | None = None
+        self.thumbnail_size: int = DEFAULT_THUMB_SIZE
         logger.info(
             "VideoPreprocess initialized: %d ignored datasets",
             len(self.ignored_datasets),
@@ -216,8 +218,8 @@ class VideoPreprocess(dl.BaseServiceRunner):
 
     # ---- entry points ----------------------------------------------------
 
-    def on_create(self, item: dl.Item, extract_metadata: bool = False,
-                  extract_thumbnail: bool = False, thumbnail_size: int = DEFAULT_THUMB_SIZE,
+    def on_create(self, item: dl.Item, extract_metadata: bool = True,
+                  extract_thumbnail: bool = True, thumbnail_size: int = DEFAULT_THUMB_SIZE,
                   max_file_size_mb: int = MAX_FILE_SIZE_MB,
                   progress: dl.Progress = None) -> dl.Item:
         """Main trigger entry point.
@@ -227,10 +229,13 @@ class VideoPreprocess(dl.BaseServiceRunner):
         thumbnail. Errors during a stage are recorded with ``record_etl_error``
         and re-raised so the service execution is marked failed.
         """
-        extract_metadata = bool(extract_metadata)
-        extract_thumbnail = bool(extract_thumbnail)
-        thumbnail_size = int(thumbnail_size)
-        max_file_size_mb = int(max_file_size_mb)
+        extract_metadata = bool(extract_metadata) if extract_metadata is not None else True
+        extract_thumbnail = bool(extract_thumbnail) if extract_thumbnail is not None else True
+        thumbnail_size = int(thumbnail_size) if thumbnail_size is not None else DEFAULT_THUMB_SIZE
+        max_file_size_mb = int(max_file_size_mb) if max_file_size_mb is not None else MAX_FILE_SIZE_MB
+
+        self.item = item
+        self.thumbnail_size = thumbnail_size
 
         logger.info(
             "on_create item=%s extract_metadata=%s extract_thumbnail=%s "
@@ -238,16 +243,7 @@ class VideoPreprocess(dl.BaseServiceRunner):
             item.id, extract_metadata, extract_thumbnail, thumbnail_size, max_file_size_mb,
         )
 
-        if extract_metadata and extract_thumbnail:
-            logger.warning(
-                "item=%s: conflicting flags (extract_metadata AND extract_thumbnail) — skipping",
-                item.id,
-            )
-            return item
-
-        do_metadata = not extract_thumbnail
-        do_thumbnail = not extract_metadata
-        if not do_metadata and not do_thumbnail:
+        if not extract_metadata and not extract_thumbnail:
             logger.info("item=%s: nothing to do (both stages disabled)", item.id)
             return item
 
@@ -284,11 +280,13 @@ class VideoPreprocess(dl.BaseServiceRunner):
             workdir = item.id
             os.makedirs(workdir, exist_ok=True)
             filepath = item.download(local_path=workdir)
+            self.workdir = workdir
+            self.filepath = filepath
 
-            if do_metadata:
-                self._extract_and_write_metadata(item, filepath)
-            if do_thumbnail:
-                self._generate_thumbnail(item, filepath, workdir, thumbnail_size)
+            if extract_metadata:
+                self._extract_and_write_metadata()
+            if extract_thumbnail:
+                self._generate_thumbnail()
 
             return item
         except Exception as e:
@@ -338,12 +336,14 @@ class VideoPreprocess(dl.BaseServiceRunner):
 
     # ---- stage: metadata -------------------------------------------------
 
-    def _extract_and_write_metadata(self, item: dl.Item, filepath: str) -> None:
+    def _extract_and_write_metadata(self) -> None:
         """Run ffprobe, populate item.metadata, validate frame count.
 
         On validation failure or any extraction error, records ``failed=True``
         on the item and re-raises so the service execution is marked failed.
         """
+        item = self.item
+        filepath = self.filepath
         try:
             probe = _run_ffprobe(filepath)
         except Exception as e:
@@ -395,6 +395,9 @@ class VideoPreprocess(dl.BaseServiceRunner):
             # ffmpeg compat dict (cleaned stream).
             ffmpeg_dict = _clean_stream_dict(dict(video_stream))
 
+            # Debug: Log item metadata before modification
+            logger.debug("item=%s: metadata BEFORE modification: %s", item.id, item.metadata)
+
             # Persist to item.metadata.system
             system = item.metadata.setdefault("system", {})
             system["ffmpeg"] = ffmpeg_dict
@@ -415,6 +418,10 @@ class VideoPreprocess(dl.BaseServiceRunner):
             item.metadata["startTime"] = start_time
             if fps is not None:
                 item.metadata["fps"] = fps
+
+            # Debug: Log item metadata after modification, before update
+            logger.debug("item=%s: metadata AFTER modification (before update): %s", item.id, item.metadata)
+            logger.debug("item=%s: system keys after modification: %s", item.id, list(system.keys()))
 
             # Validation: prefer read frame count (more accurate when counted).
             r_frames = nb_read_frames if nb_read_frames is not None else nb_frames
@@ -452,6 +459,9 @@ class VideoPreprocess(dl.BaseServiceRunner):
                 "item=%s metadata persisted: %dx%d fps=%s duration=%s nb_frames=%s",
                 item.id, width or 0, height or 0, fps, duration, nb_frames,
             )
+            # Debug: Log item metadata after update to verify persistence
+            logger.debug("item=%s: metadata AFTER update: %s", item.id, item.metadata)
+            logger.debug("item=%s: system keys after update: %s", item.id, list(item.metadata.get("system", {}).keys()))
         except Exception as e:
             # Avoid double-recording validation errors (already recorded above).
             if not item.metadata.get("system", {}).get("etl", {}).get("failed"):
@@ -465,9 +475,12 @@ class VideoPreprocess(dl.BaseServiceRunner):
 
     # ---- stage: thumbnail ------------------------------------------------
 
-    def _generate_thumbnail(self, item: dl.Item, filepath: str, workdir: str,
-                            thumbnail_size: int) -> None:
+    def _generate_thumbnail(self) -> None:
         """Create a short GIF preview and upload it to /.dataloop/thumbnails."""
+        item = self.item
+        filepath = self.filepath
+        workdir = self.workdir
+        thumbnail_size = self.thumbnail_size
         try:
             file_size = (
                 os.path.getsize(filepath) if os.path.isfile(filepath) else 0
@@ -494,12 +507,22 @@ class VideoPreprocess(dl.BaseServiceRunner):
                 item_metadata={"system": {"thumbnailOf": item.id}},
             )
 
+            # Debug: Log metadata before setting thumbnailId
+            logger.debug("item=%s: metadata BEFORE setting thumbnailId: %s", item.id, item.metadata)
+
             item.metadata.setdefault("system", {})["thumbnailId"] = thumbnail_item.id
+
+            # Debug: Log metadata after setting thumbnailId, before update
+            logger.debug("item=%s: metadata AFTER setting thumbnailId (before update): %s", item.id, item.metadata)
+
             item.update(system_metadata=True)
             logger.info(
                 "item=%s thumbnail uploaded: id=%s",
                 item.id, thumbnail_item.id,
             )
+
+            # Debug: Log metadata after update to verify persistence
+            logger.debug("item=%s: metadata AFTER thumbnail update: %s", item.id, item.metadata)
         except Exception as e:
             if not item.metadata.get("system", {}).get("etl", {}).get("failed"):
                 logger.exception("item=%s: thumbnail stage failed", item.id)

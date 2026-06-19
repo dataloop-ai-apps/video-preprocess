@@ -6,7 +6,7 @@
     "attributes": {
         "Provider": "Dataloop"
     },
-    "version": "1.0.0",
+    "version": "1.0.8",
     "scope": "project",
     "components": {
         "modules": [
@@ -75,7 +75,6 @@
                     },
                     "preemptible": false
                 },
-                "botUserName": "pipelines@dataloop.ai",
                 "executionTimeout": 10800,
                 "maxAttempts": 3,
                 "onReset": "failed"
@@ -147,8 +146,8 @@
                         "functionName": "on_create"
                     },
                     "input": {
-                        "extract_metadata": false,
-                        "extract_thumbnail": false,
+                        "extract_metadata": true,
+                        "extract_thumbnail": true,
                         "thumbnail_size": 128,
                         "max_file_size_mb": 2000
                     }
