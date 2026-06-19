@@ -2,6 +2,7 @@
     "name": "video-preprocess-husam",
     "displayName": "Video Preprocess husam",
     "description": "Unified Video Preprocess Application - metadata extraction and thumbnail generation",
+    "Application Type": ["Preprocess"],
     "attributes": {
         "Provider": "Dataloop"
     },
@@ -22,6 +23,22 @@
                             {
                                 "type": "Item",
                                 "name": "item"
+                            },
+                            {
+                                "name": "extract_metadata",
+                                "type": "Boolean"
+                            },
+                            {
+                                "name": "extract_thumbnail",
+                                "type": "Boolean"
+                            },
+                            {
+                                "name": "thumbnail_size",
+                                "type": "Integer"
+                            },
+                            {
+                                "name": "max_file_size_mb",
+                                "type": "Integer"
                             }
                         ],
                         "output": []
@@ -130,8 +147,8 @@
                         "functionName": "on_create"
                     },
                     "input": {
-                        "metadata_only": false,
-                        "thumbnail_only": false,
+                        "extract_metadata": false,
+                        "extract_thumbnail": false,
                         "thumbnail_size": 128,
                         "max_file_size_mb": 2000
                     }

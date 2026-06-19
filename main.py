@@ -216,39 +216,37 @@ class VideoPreprocess(dl.BaseServiceRunner):
 
     # ---- entry points ----------------------------------------------------
 
-    def on_create(self, item: dl.Item, context: dl.Context = None,
+    def on_create(self, item: dl.Item, extract_metadata: bool = False,
+                  extract_thumbnail: bool = False, thumbnail_size: int = DEFAULT_THUMB_SIZE,
+                  max_file_size_mb: int = MAX_FILE_SIZE_MB,
                   progress: dl.Progress = None) -> dl.Item:
         """Main trigger entry point.
 
-        Reads ``context.trigger_input`` for per-invocation config, falling back
-        to module-level constants. Stages run in this order: metadata then
+        Parameters are passed directly from trigger input with module-level
+        constant fallbacks. Stages run in this order: metadata then
         thumbnail. Errors during a stage are recorded with ``record_etl_error``
         and re-raised so the service execution is marked failed.
         """
-        trigger_input = {}
-        if context is not None and hasattr(context, "trigger_input"):
-            trigger_input = context.trigger_input or {}
-
-        metadata_only = bool(trigger_input.get("metadata_only", False))
-        thumbnail_only = bool(trigger_input.get("thumbnail_only", False))
-        thumbnail_size = int(trigger_input.get("thumbnail_size", DEFAULT_THUMB_SIZE))
-        max_file_size_mb = int(trigger_input.get("max_file_size_mb", MAX_FILE_SIZE_MB))
+        extract_metadata = bool(extract_metadata)
+        extract_thumbnail = bool(extract_thumbnail)
+        thumbnail_size = int(thumbnail_size)
+        max_file_size_mb = int(max_file_size_mb)
 
         logger.info(
-            "on_create item=%s metadata_only=%s thumbnail_only=%s "
+            "on_create item=%s extract_metadata=%s extract_thumbnail=%s "
             "thumbnail_size=%d max_file_size_mb=%d",
-            item.id, metadata_only, thumbnail_only, thumbnail_size, max_file_size_mb,
+            item.id, extract_metadata, extract_thumbnail, thumbnail_size, max_file_size_mb,
         )
 
-        if metadata_only and thumbnail_only:
+        if extract_metadata and extract_thumbnail:
             logger.warning(
-                "item=%s: conflicting flags (metadata_only AND thumbnail_only) — skipping",
+                "item=%s: conflicting flags (extract_metadata AND extract_thumbnail) — skipping",
                 item.id,
             )
             return item
 
-        do_metadata = not thumbnail_only
-        do_thumbnail = not metadata_only
+        do_metadata = not extract_thumbnail
+        do_thumbnail = not extract_metadata
         if not do_metadata and not do_thumbnail:
             logger.info("item=%s: nothing to do (both stages disabled)", item.id)
             return item
