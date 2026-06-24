@@ -2,12 +2,23 @@
     "name": "video-preprocess-app",
     "displayName": "Video Preprocess App",
     "description": "Unified Video Preprocess Application - metadata extraction and thumbnail generation",
-    "Application Type": ["Preprocess"],
     "attributes": {
-        "Provider": "Dataloop"
+        "Category": "Application",
+        "Provider": "Dataloop",
+        "Application Type": [
+            "Preprocess"
+        ],
+        "Media Type": [
+            "Video"
+        ]
     },
-    "version": "1.0.10",
-    "scope": "project",
+    "codebase": {
+        "type": "git",
+        "gitUrl": "https://github.com/dataloop-ai-apps/video-preprocess.git",
+        "gitTag": "2.1.0"
+    },
+    "version": "2.1.0",
+    "scope": "public",
     "components": {
         "modules": [
             {
@@ -75,7 +86,9 @@
                     },
                     "preemptible": false
                 },
+                "botUserName": "pipelines@dataloop.ai",
                 "executionTimeout": 10800,
+                "drainTime": 600,
                 "maxAttempts": 3,
                 "onReset": "failed"
             }
@@ -83,10 +96,18 @@
         "triggers": [
             {
                 "name": "video-preprocess-created-app",
-                "active": true,
+                "namespace": "services.video-preprocess-app",
                 "type": "Event",
                 "scope": "system",
-                "namespace": "services.video-preprocess-app",
+                "active": true,
+                "template": true,
+                "activation": {
+                    "autoClone": true,
+                    "cloneActiveDefault": true,
+                    "overridable": false
+                },
+                "applyOnExistingProjects": true,
+                "activateOnExistingProjects": false,
                 "spec": {
                     "resource": "Item",
                     "actions": [
@@ -143,7 +164,8 @@
                     },
                     "operation": {
                         "type": "function",
-                        "functionName": "on_create"
+                        "functionName": "on_create",
+                        "serviceName": "video-preprocess-app"
                     },
                     "input": {
                         "extract_metadata": true,
@@ -155,10 +177,18 @@
             },
             {
                 "name": "video-preprocess-app-deleted",
-                "active": true,
+                "namespace": "services.video-preprocess-app",
                 "type": "Event",
                 "scope": "system",
-                "namespace": "services.video-preprocess-app",
+                "active": true,
+                "template": true,
+                "activation": {
+                    "autoClone": true,
+                    "cloneActiveDefault": true,
+                    "overridable": false
+                },
+                "applyOnExistingProjects": true,
+                "activateOnExistingProjects": false,
                 "spec": {
                     "resource": "Item",
                     "actions": [
@@ -205,7 +235,8 @@
                     "input": {},
                     "operation": {
                         "type": "function",
-                        "functionName": "on_delete"
+                        "functionName": "on_delete",
+                        "serviceName": "video-preprocess-app"
                     }
                 }
             }
