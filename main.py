@@ -183,10 +183,6 @@ class VideoPreprocess(dl.BaseServiceRunner):
 
     def __init__(self):
         self.ignored_datasets = self._load_ignore_list()
-        self.item: dl.Item | None = None
-        self.filepath: str | None = None
-        self.workdir: str | None = None
-        self.thumbnail_size: int = DEFAULT_THUMB_SIZE
         logger.info(
             "VideoPreprocess initialized: %d ignored datasets",
             len(self.ignored_datasets),
@@ -234,9 +230,6 @@ class VideoPreprocess(dl.BaseServiceRunner):
         thumbnail_size = int(thumbnail_size) if thumbnail_size is not None else DEFAULT_THUMB_SIZE
         max_file_size_mb = int(max_file_size_mb) if max_file_size_mb is not None else MAX_FILE_SIZE_MB
 
-        self.item = item
-        self.thumbnail_size = thumbnail_size
-
         logger.info(
             "on_create item=%s extract_metadata=%s extract_thumbnail=%s "
             "thumbnail_size=%d max_file_size_mb=%d",
@@ -277,16 +270,15 @@ class VideoPreprocess(dl.BaseServiceRunner):
 
         workdir = None
         try:
-            workdir = item.id
+            workdir = os.path.abspath(item.id)
             os.makedirs(workdir, exist_ok=True)
             filepath = item.download(local_path=workdir)
-            self.workdir = workdir
-            self.filepath = filepath
+            logger.debug("item=%s: workdir=%s filepath=%s", item.id, workdir, filepath)
 
             if extract_metadata:
-                self._extract_and_write_metadata()
+                self._extract_and_write_metadata(item, filepath)
             if extract_thumbnail:
-                self._generate_thumbnail()
+                self._generate_thumbnail(item, filepath, workdir, thumbnail_size)
 
             return item
         except Exception as e:
@@ -336,14 +328,12 @@ class VideoPreprocess(dl.BaseServiceRunner):
 
     # ---- stage: metadata -------------------------------------------------
 
-    def _extract_and_write_metadata(self) -> None:
+    def _extract_and_write_metadata(self, item: dl.Item, filepath: str) -> None:
         """Run ffprobe, populate item.metadata, validate frame count.
 
         On validation failure or any extraction error, records ``failed=True``
         on the item and re-raises so the service execution is marked failed.
         """
-        item = self.item
-        filepath = self.filepath
         try:
             probe = _run_ffprobe(filepath)
         except Exception as e:
@@ -491,12 +481,8 @@ class VideoPreprocess(dl.BaseServiceRunner):
 
     # ---- stage: thumbnail ------------------------------------------------
 
-    def _generate_thumbnail(self) -> None:
+    def _generate_thumbnail(self, item: dl.Item, filepath: str, workdir: str, thumbnail_size: int) -> None:
         """Create a short GIF preview and upload it to /.dataloop/thumbnails."""
-        item = self.item
-        filepath = self.filepath
-        workdir = self.workdir
-        thumbnail_size = self.thumbnail_size
         try:
             file_size = (
                 os.path.getsize(filepath) if os.path.isfile(filepath) else 0
@@ -512,7 +498,11 @@ class VideoPreprocess(dl.BaseServiceRunner):
                 raise ValueError(msg)
 
             gif_filepath = os.path.join(workdir, f"{item.id}.gif")
+            logger.debug("item=%s: building GIF at %s", item.id, gif_filepath)
             self._build_gif(filepath, gif_filepath, thumbnail_size)
+            logger.debug("item=%s: GIF built, exists=%s size=%d", item.id,
+                         os.path.isfile(gif_filepath),
+                         os.path.getsize(gif_filepath) if os.path.isfile(gif_filepath) else 0)
 
             dataset = dl.datasets.get(dataset_id=item.datasetId, fetch=False)
             thumbnail_item = dataset.items.upload(
@@ -522,6 +512,9 @@ class VideoPreprocess(dl.BaseServiceRunner):
                 overwrite=True,
                 item_metadata={"system": {"thumbnailOf": item.id}},
             )
+
+            if thumbnail_item is None:
+                raise RuntimeError(f"GIF upload returned None for {gif_filepath} — upload failed")
 
             # Debug: Log metadata before setting thumbnailId
             logger.debug("item=%s: metadata BEFORE setting thumbnailId: %s", item.id, item.metadata)
