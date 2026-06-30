@@ -15,9 +15,9 @@
     "codebase": {
         "type": "git",
         "gitUrl": "https://github.com/dataloop-ai-apps/video-preprocess.git",
-        "gitTag": "2.1.1"
+        "gitTag": "2.1.2"
     },
-    "version": "2.1.1",
+    "version": "2.1.2",
     "scope": "public",
     "components": {
         "modules": [
