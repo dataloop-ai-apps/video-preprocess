@@ -259,15 +259,6 @@ class VideoPreprocess(dl.BaseServiceRunner):
             # If dataset metadata isn't readable, proceed with processing.
             pass
 
-        # File-size guard (uses platform-reported size to avoid downloading huge files).
-        file_size = item.metadata.get("system", {}).get("size", 0) or 0
-        if file_size and file_size > max_file_size_mb * 1024 * 1024:
-            msg = f"File too large: {file_size} bytes exceeds {max_file_size_mb}MB limit"
-            logger.error("item=%s: %s", item.id, msg)
-            record_etl_error(item, "size_check", msg, failed=True)
-            item.update(system_metadata=True)
-            raise ValueError(msg)
-
         workdir = None
         try:
             workdir = os.path.abspath(item.id)
@@ -419,6 +410,7 @@ class VideoPreprocess(dl.BaseServiceRunner):
                 system["duration"] = float(duration)
             system["nb_frames"] = nb_frames
             system["nb_streams"] = nb_streams
+            system["size"] = os.path.getsize(filepath)
 
             # Backward-compat top-level fields.
             item.metadata["startTime"] = start_time
