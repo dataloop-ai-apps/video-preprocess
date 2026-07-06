@@ -56,7 +56,7 @@
                     },
                     {
                         "name": "on_delete",
-                        "description": "Delete resources created by video preprocess (thumbnail, webm modality)",
+                        "description": "Delete resources created by video preprocess (thumbnail)",
                         "input": [
                             {
                                 "type": "Item",
@@ -118,21 +118,11 @@
                     "filter": {
                         "$or": [
                             {
-                                "$and": [
-                                    {
-                                        "metadata": {
-                                            "system": {
-                                                "mimetype": "video/*"
-                                            }
-                                        }
-                                    },
-                                    {
-                                        "hidden": false
-                                    },
-                                    {
-                                        "type": "file"
+                                "metadata": {
+                                    "system": {
+                                        "mimetype": "video/*"
                                     }
-                                ]
+                                }
                             },
                             {
                                 "$and": [
