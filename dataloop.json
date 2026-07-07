@@ -99,7 +99,7 @@
                 "namespace": "services.video-preprocess-app",
                 "type": "Event",
                 "scope": "system",
-                "active": true,
+                "active": false,
                 "template": true,
                 "activation": {
                     "autoClone": true,
@@ -170,7 +170,7 @@
                 "namespace": "services.video-preprocess-app",
                 "type": "Event",
                 "scope": "system",
-                "active": true,
+                "active": false,
                 "template": true,
                 "activation": {
                     "autoClone": true,
