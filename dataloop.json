@@ -1,6 +1,6 @@
 {
     "name": "video-preprocess-app",
-    "displayName": "Video Preprocess App",
+    "displayName": "Video Preprocess",
     "description": "Unified Video Preprocess Application - metadata extraction and thumbnail generation",
     "attributes": {
         "Category": "Application",
