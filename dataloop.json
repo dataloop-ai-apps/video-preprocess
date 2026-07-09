@@ -99,15 +99,15 @@
                 "namespace": "services.video-preprocess-app",
                 "type": "Event",
                 "scope": "system",
-                "active": false,
+                "active": true,
                 "template": true,
                 "activation": {
                     "autoClone": true,
                     "cloneActiveDefault": true,
-                    "overridable": false
+                    "overridable": true
                 },
                 "applyOnExistingProjects": true,
-                "activateOnExistingProjects": false,
+                "activateOnExistingProjects": true,
                 "spec": {
                     "resource": "Item",
                     "actions": [
@@ -170,15 +170,15 @@
                 "namespace": "services.video-preprocess-app",
                 "type": "Event",
                 "scope": "system",
-                "active": false,
+                "active": true,
                 "template": true,
                 "activation": {
                     "autoClone": true,
                     "cloneActiveDefault": true,
-                    "overridable": false
+                    "overridable": true
                 },
                 "applyOnExistingProjects": true,
-                "activateOnExistingProjects": false,
+                "activateOnExistingProjects": true,
                 "spec": {
                     "resource": "Item",
                     "actions": [
