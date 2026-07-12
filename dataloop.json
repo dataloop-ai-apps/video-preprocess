@@ -98,7 +98,6 @@
                 "name": "video-preprocess-created-app",
                 "namespace": "services.video-preprocess-app",
                 "type": "Event",
-                "scope": "system",
                 "active": true,
                 "template": true,
                 "activation": {
@@ -169,7 +168,6 @@
                 "name": "video-preprocess-app-deleted",
                 "namespace": "services.video-preprocess-app",
                 "type": "Event",
-                "scope": "system",
                 "active": true,
                 "template": true,
                 "activation": {
