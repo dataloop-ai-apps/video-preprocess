@@ -74,7 +74,7 @@
                 "moduleName": "video_preprocess_module",
                 "runtime": {
                     "podType": "regular-m",
-                    "runnerImage": "gcr.io/viewo-g/piper/agent/cpu/video-preprocess:4",
+                    "runnerImage": "hub.dataloop.ai/dtlpy-runner-images/cpu:python3.14_full",
                     "concurrency": 5,
                     "autoscaler": {
                         "type": "rabbitmq",
