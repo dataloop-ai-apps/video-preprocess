@@ -50,6 +50,14 @@
                             {
                                 "name": "max_file_size_mb",
                                 "type": "Integer"
+                            },
+                            {
+                                "name": "max_thumbnail_edge",
+                                "type": "Integer"
+                            },
+                            {
+                                "name": "max_thumbnail_size_mb",
+                                "type": "Integer"
                             }
                         ],
                         "output": []
@@ -160,7 +168,9 @@
                         "extract_metadata": true,
                         "extract_thumbnail": true,
                         "thumbnail_size": 128,
-                        "max_file_size_mb": 2000
+                        "max_file_size_mb": 2000,
+                        "max_thumbnail_edge": 512,
+                        "max_thumbnail_size_mb": 3
                     }
                 }
             },
