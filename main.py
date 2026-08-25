@@ -137,8 +137,43 @@ def _run_ffprobe(filepath: str) -> dict:
         raise RuntimeError(f"ffprobe returned invalid JSON: {e}") from e
 
 
+def _extract_rotation_degrees(video_stream: dict) -> int:
+    """Return the clockwise display rotation in degrees (0/90/180/270).
+
+    ffmpeg/ffprobe >= 6.0 stopped populating ``tags.rotate`` for videos with
+    a QuickTime/MP4 rotation matrix; it's only exposed via
+    ``side_data_list[].rotation`` (the "Display Matrix" side data) now. That
+    field is the counter-clockwise rotation baked into the matrix -- the
+    opposite sign convention from the legacy tag -- so it needs negating and
+    normalizing to land back on the old 0/90/180/270 convention. Verified
+    against a real sample: side_data rotation=-90 <-> legacy tags.rotate="90".
+    """
+    legacy = video_stream.get("tags", {}).get("rotate")
+    if legacy is not None:
+        try:
+            return int(legacy) % 360
+        except (TypeError, ValueError):
+            pass
+    for side_data in video_stream.get("side_data_list", []) or []:
+        if "rotation" in side_data:
+            try:
+                return int(-side_data["rotation"]) % 360
+            except (TypeError, ValueError):
+                continue
+    return 0
+
+
 def _clean_stream_dict(stream: dict) -> dict:
-    """Clean the ffprobe stream dict (in place)."""
+    """Clean the ffprobe stream dict, backfilling ``tags.rotate`` if needed.
+
+    ffprobe >= 6.0 dropped ``tags.rotate`` in favor of ``side_data_list``
+    (see ``_extract_rotation_degrees``). This restores the field so any
+    downstream consumer (frontend player, annotation coordinate system, SDK)
+    still reading ``system.ffmpeg.tags.rotate`` keeps working unchanged.
+    """
+    rotation = _extract_rotation_degrees(stream)
+    if rotation and not stream.get("tags", {}).get("rotate"):
+        stream["tags"] = {**stream.get("tags", {}), "rotate": str(rotation)}
     return stream
 
 
