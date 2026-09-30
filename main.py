@@ -6,10 +6,13 @@ and one trigger. Per-invocation behaviour is controlled via
 ``context.trigger_input`` with module-level constant fallbacks.
 
 Inputs (read from ``context.trigger_input``):
-    metadata_only      – bool (default False)  only run ffprobe metadata stage
-    thumbnail_only     – bool (default False)  only run thumbnail stage
-    thumbnail_size     – int  (default DEFAULT_THUMB_SIZE)
-    max_file_size_mb   – int  (default MAX_FILE_SIZE_MB)
+    metadata_only         – bool (default False)  only run ffprobe metadata stage
+    thumbnail_only        – bool (default False)  only run thumbnail stage
+    thumbnail_size        – int  (default DEFAULT_THUMB_SIZE)
+    max_file_size_mb      – int  (default MAX_FILE_SIZE_MB)
+    max_thumbnail_edge    – int  (default MAX_THUMBNAIL_EDGE)
+    max_thumbnail_size_mb – int  (default MAX_THUMBNAIL_SIZE_MB) caps GIF output
+                             size by progressively shrinking resolution
 """
 
 from __future__ import annotations
@@ -34,7 +37,9 @@ logger = logging.getLogger("video-preprocess")
 
 DEFAULT_THUMB_SIZE = 128
 MAX_FILE_SIZE_MB = 2000        # overall input video size guard
-MAX_GEN_THUMB_SIZE_MB = 70     # additional guard specifically for thumbnail stage
+MAX_THUMBNAIL_EDGE = 512
+MAX_THUMBNAIL_SIZE_MB = 3      # GIF output budget; resolution shrinks to fit
+MIN_THUMBNAIL_EDGE = 32        # floor for the shrink-to-fit retries
 THUMB_DURATION_SEC = 3.0
 THUMB_SPEED_FACTOR = 0.25      # decoded frames played back at 1/4 speed for the GIF
 
@@ -252,6 +257,8 @@ class VideoPreprocess(dl.BaseServiceRunner):
     def on_create(self, item: dl.Item, extract_metadata: bool = True,
                   extract_thumbnail: bool = True, thumbnail_size: int = DEFAULT_THUMB_SIZE,
                   max_file_size_mb: int = MAX_FILE_SIZE_MB,
+                  max_thumbnail_edge: int = MAX_THUMBNAIL_EDGE,
+                  max_thumbnail_size_mb: int = MAX_THUMBNAIL_SIZE_MB,
                   progress: dl.Progress = None) -> dl.Item:
         """Main trigger entry point.
 
@@ -264,11 +271,20 @@ class VideoPreprocess(dl.BaseServiceRunner):
         extract_thumbnail = bool(extract_thumbnail) if extract_thumbnail is not None else True
         thumbnail_size = int(thumbnail_size) if thumbnail_size is not None else DEFAULT_THUMB_SIZE
         max_file_size_mb = int(max_file_size_mb) if max_file_size_mb is not None else MAX_FILE_SIZE_MB
+        max_thumbnail_edge = int(max_thumbnail_edge) if max_thumbnail_edge is not None else MAX_THUMBNAIL_EDGE
+        max_thumbnail_size_mb = int(max_thumbnail_size_mb) if max_thumbnail_size_mb is not None else MAX_THUMBNAIL_SIZE_MB
+        if thumbnail_size > max_thumbnail_edge:
+            logger.warning(
+                "item=%s: thumbnail_size=%d exceeds max_thumbnail_edge=%d, clamping",
+                item.id, thumbnail_size, max_thumbnail_edge,
+            )
+            thumbnail_size = max_thumbnail_edge
 
         logger.info(
             "on_create item=%s extract_metadata=%s extract_thumbnail=%s "
-            "thumbnail_size=%d max_file_size_mb=%d",
-            item.id, extract_metadata, extract_thumbnail, thumbnail_size, max_file_size_mb,
+            "thumbnail_size=%d max_file_size_mb=%d max_thumbnail_size_mb=%d",
+            item.id, extract_metadata, extract_thumbnail,
+            thumbnail_size, max_file_size_mb, max_thumbnail_size_mb,
         )
 
         if not extract_metadata and not extract_thumbnail:
@@ -294,17 +310,35 @@ class VideoPreprocess(dl.BaseServiceRunner):
             # If dataset metadata isn't readable, proceed with processing.
             pass
 
+        # Reject files over the configured size limit before downloading.
+        # Thumbnail-only runs may stream the video without a full download,
+        # so this guard only blocks the metadata (download + ffprobe) path.
+        size_bytes = item.metadata.get("system", {}).get("size")
+        max_file_size_bytes = max_file_size_mb * 1024 * 1024
+        if extract_metadata and size_bytes is not None and size_bytes > max_file_size_bytes:
+            msg = (
+                f"Item size {size_bytes} bytes exceeds max_file_size_mb="
+                f"{max_file_size_mb}"
+            )
+            logger.error("item=%s: %s", item.id, msg)
+            record_etl_error(item, "validation", msg, failed=True)
+            item.update(system_metadata=True)
+            raise ValueError(msg)
+
         workdir = None
         try:
             workdir = os.path.abspath(item.id)
             os.makedirs(workdir, exist_ok=True)
-            filepath = item.download(local_path=workdir)
-            logger.debug("item=%s: workdir=%s filepath=%s", item.id, workdir, filepath)
+            filepath = None
 
             if extract_metadata:
+                filepath = item.download(local_path=workdir)
+                logger.debug("item=%s: workdir=%s filepath=%s", item.id, workdir, filepath)
                 self._extract_and_write_metadata(item, filepath)
+
             if extract_thumbnail:
-                self._generate_thumbnail(item, filepath, workdir, thumbnail_size)
+                self._generate_thumbnail(item, workdir, thumbnail_size,
+                                         max_thumbnail_size_mb, filepath=filepath)
 
             return item
         except Exception as e:
@@ -508,27 +542,45 @@ class VideoPreprocess(dl.BaseServiceRunner):
 
     # ---- stage: thumbnail ------------------------------------------------
 
-    def _generate_thumbnail(self, item: dl.Item, filepath: str, workdir: str, thumbnail_size: int) -> None:
-        """Create a short GIF preview and upload it to /.dataloop/thumbnails."""
-        try:
-            file_size = (
-                os.path.getsize(filepath) if os.path.isfile(filepath) else 0
-            )
-            if file_size > MAX_GEN_THUMB_SIZE_MB * 1024 * 1024:
-                msg = (
-                    f"File too large for thumbnail: {file_size} bytes "
-                    f"exceeds {MAX_GEN_THUMB_SIZE_MB}MB limit"
-                )
-                logger.error("item=%s: %s", item.id, msg)
-                record_etl_error(item, "thumbnail_size", msg, failed=True)
-                item.update(system_metadata=True)
-                raise ValueError(msg)
+    def _generate_thumbnail(self, item: dl.Item, workdir: str,
+                             thumbnail_size: int,
+                             max_thumbnail_size_mb: int = MAX_THUMBNAIL_SIZE_MB,
+                             filepath: str | None = None) -> None:
+        """Create a short GIF preview and upload it to /.dataloop/thumbnails.
 
+        If a local *filepath* is provided (because metadata was also extracted)
+        it is used. Otherwise the item's ``.stream`` URL is fed to ffmpeg so
+        the full video does not need to be downloaded. If streaming fails, a
+        one-shot download is used as the fallback.
+        """
+        try:
             gif_filepath = os.path.join(workdir, f"{item.id}.gif")
             logger.debug("item=%s: building GIF at %s", item.id, gif_filepath)
-            self._build_gif(filepath, gif_filepath, thumbnail_size)
-            logger.debug("item=%s: GIF built, exists=%s size=%d", item.id,
-                         os.path.isfile(gif_filepath),
+
+            # Prefer a local file when one is already staged.
+            if filepath is not None and os.path.isfile(filepath):
+                logger.info("item=%s: using local file for thumbnail", item.id)
+                self._build_gif(filepath, gif_filepath, thumbnail_size, max_thumbnail_size_mb)
+            else:
+                # Stream only the first part of the video for the thumbnail.
+                stream_url = item.stream
+                auth = VideoPreprocess._get_auth_header()
+                logger.info(
+                    "item=%s: streaming thumbnail from %s", item.id, stream_url
+                )
+                try:
+                    self._build_gif(stream_url, gif_filepath, thumbnail_size,
+                                    max_thumbnail_size_mb, auth=auth)
+                except Exception:
+                    logger.exception(
+                        "item=%s: streaming thumbnail failed, falling back to download",
+                        item.id,
+                    )
+                    if filepath is None:
+                        filepath = item.download(local_path=workdir)
+                    self._build_gif(filepath, gif_filepath, thumbnail_size,
+                                    max_thumbnail_size_mb)
+            logger.debug("item=%s: GIF built, size=%d", item.id,
                          os.path.getsize(gif_filepath) if os.path.isfile(gif_filepath) else 0)
 
             dataset = dl.datasets.get(dataset_id=item.datasetId, fetch=False)
@@ -570,7 +622,70 @@ class VideoPreprocess(dl.BaseServiceRunner):
             raise
 
     @staticmethod
-    def _build_gif(src_filepath: str, dst_filepath: str, thumb_size: int) -> None:
+    def _get_auth_header() -> str:
+        """Return the Dataloop JWT used by ``dl.client_api`` for HTTP headers."""
+        auth = dl.client_api.auth
+        if isinstance(auth, dict):
+            return auth.get("authorization") or ""
+        return getattr(auth, "authorization", "") or ""
+
+    @staticmethod
+    def _ffmpeg_gif(src: str, dst: str, thumb_size: int, auth: str,
+                    duration: float = THUMB_DURATION_SEC) -> None:
+        """Decode the first *duration* seconds via ffmpeg and write a GIF.
+
+        *src* may be a local file path or a stream URL. When *auth* is given it
+        is sent as the ``Authorization`` header for the HTTP request.
+        """
+        headers = f"Authorization: {auth}\r\n"
+        cmd = [
+            "ffmpeg", "-y",
+            "-headers", headers,
+            "-ss", "0",
+            "-i", src,
+            "-t", str(duration),
+            "-vf", f"fps=5,scale={thumb_size}:-1:flags=lanczos",
+            "-gifflags", "+transdiff",
+            dst,
+        ]
+        logger.debug("ffmpeg command: %s", " ".join(cmd))
+        subprocess.run(cmd, check=True, timeout=120)
+
+    @staticmethod
+    def _build_gif(src: str, dst_filepath: str, thumb_size: int,
+                    max_size_mb: int = MAX_THUMBNAIL_SIZE_MB,
+                    auth: str | None = None) -> None:
+        """Build a GIF, shrinking resolution until it fits ``max_size_mb``.
+
+        Encodes at *thumb_size*, and if the result exceeds the budget, halves
+        the resolution and re-encodes (down to ``MIN_THUMBNAIL_EDGE``). This
+        never fails on size — worst case, the last attempt at the floor
+        resolution is used as-is.
+
+        When *src* is a URL or *auth* is supplied the encode uses ffmpeg on a
+        stream; otherwise OpenCV is used for local files.
+        """
+        max_size_bytes = max_size_mb * 1024 * 1024
+        size = thumb_size
+        stream = auth is not None or src.startswith(("http://", "https://"))
+        while True:
+            if stream:
+                VideoPreprocess._ffmpeg_gif(src, dst_filepath, size, auth)
+            else:
+                VideoPreprocess._encode_gif(src, dst_filepath, size)
+            actual_bytes = os.path.getsize(dst_filepath)
+            if actual_bytes <= max_size_bytes or size <= MIN_THUMBNAIL_EDGE:
+                return
+            next_size = max(size // 2, MIN_THUMBNAIL_EDGE)
+            logger.warning(
+                "GIF %d bytes exceeds max_thumbnail_size_mb=%d at edge=%d, "
+                "re-encoding at edge=%d",
+                actual_bytes, max_size_mb, size, next_size,
+            )
+            size = next_size
+
+    @staticmethod
+    def _encode_gif(src_filepath: str, dst_filepath: str, thumb_size: int) -> None:
         """Decode the first ``THUMB_DURATION_SEC`` seconds and write a GIF."""
         cap = cv2.VideoCapture(src_filepath)
         try:
