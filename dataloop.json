@@ -73,7 +73,7 @@
                 "name": "video-preprocess-app",
                 "moduleName": "video_preprocess_module",
                 "runtime": {
-                    "podType": "regular-m",
+                    "podType": "regular-s",
                     "runnerImage": "hub.dataloop.ai/customerhub/piper/agent/runner/cpu/base:python3.13_full_bci",
                     "concurrency": 5,
                     "autoscaler": {
