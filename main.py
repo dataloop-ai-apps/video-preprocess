@@ -517,12 +517,12 @@ class VideoPreprocess(dl.BaseServiceRunner):
             if file_size > MAX_GEN_THUMB_SIZE_MB * 1024 * 1024:
                 msg = (
                     f"File too large for thumbnail: {file_size} bytes "
-                    f"exceeds {MAX_GEN_THUMB_SIZE_MB}MB limit"
+                    f"exceeds {MAX_GEN_THUMB_SIZE_MB}MB limit, thumbnail skipped"
                 )
-                logger.error("item=%s: %s", item.id, msg)
-                record_etl_error(item, "thumbnail_size", msg, failed=True)
+                logger.warning("item=%s: %s", item.id, msg)
+                record_etl_error(item, "thumbnail_size", msg, failed=False)
                 item.update(system_metadata=True)
-                raise ValueError(msg)
+                return
 
             gif_filepath = os.path.join(workdir, f"{item.id}.gif")
             logger.debug("item=%s: building GIF at %s", item.id, gif_filepath)
